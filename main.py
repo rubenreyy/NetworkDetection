@@ -1,8 +1,11 @@
 from transformers import TrainingArguments, Trainer, AutoModelForSequenceClassification, DataCollatorWithPadding
 from transformers import AutoTokenizer
 from datasets import load_dataset
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, confusion_matrix
+import seaborn as sns
 import matplotlib.pyplot as plt
+import torch
+import numpy as np
 
 # Tokenize the data
 model_name = 'bert-base-uncased'
@@ -86,27 +89,47 @@ test_dataset = test_dataset.map(map_labels)
 tokenized_training = tokenized_training.map(lambda x: {"labels": label_mapping[x["attack"]]})
 tokenized_testing = tokenized_testing.map(lambda x: {"labels": label_mapping[x["attack"]]})
 
+# Calculate class weights
+labels = tokenized_training['labels']
+class_counts = np.bincount(labels)  # Count occurrences of each class label
+class_weights = 1.0 / class_counts
+normalized_weights = class_weights / class_weights.sum()  # Normalize to ensure weights add to 1
+weights = torch.tensor(normalized_weights).float().to('cuda')  # Move weights to GPU
+
+print(f"Class Counts: {class_counts}")
+print(f"Class Weights: {weights}")
+
+# Override the Trainer to include weighted loss
+class WeightedLossTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+        loss_fn = torch.nn.CrossEntropyLoss(weight=weights)
+        loss = loss_fn(logits, labels)
+        return (loss, outputs) if return_outputs else loss
+
 # Initialize the model
-model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=5) 
+model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=5)
 
 # Define training arguments
 training_args = TrainingArguments(
     output_dir="./results",
     evaluation_strategy="epoch",
     save_strategy="epoch",
-    learning_rate=2e-5,
+    learning_rate=1e-5,
     per_device_train_batch_size=16,
     per_device_eval_batch_size=16,
-    num_train_epochs=2,
-    weight_decay=0.01,
+    num_train_epochs=1,
+    weight_decay=0.1,
     save_total_limit=2,
     logging_dir='./logs',
     logging_steps=10,
     load_best_model_at_end=True,
 )
 
-# Initialize Trainer
-trainer = Trainer(
+# Initialize Trainer with weighted loss
+trainer = WeightedLossTrainer(
     model=model,
     args=training_args,
     train_dataset=tokenized_training,
@@ -115,23 +138,6 @@ trainer = Trainer(
     data_collator=data_collator,
 )
 
-# Add learning rate scheduler (built into Trainer)
-def get_lr_scheduler(optimizer):
-    from transformers import get_scheduler
-    num_training_steps = len(tokenized_training) // training_args.per_device_train_batch_size * training_args.num_train_epochs
-    return get_scheduler(
-        name="linear", optimizer=optimizer, num_warmup_steps=0, num_training_steps=num_training_steps
-    )
-
-# Track loss
-train_losses = []
-eval_losses = []
-
-def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    predictions = logits.argmax(axis=-1)
-    return classification_report(labels, predictions, output_dict=True)
-
 # Train the model
 trainer.train()
 
@@ -139,25 +145,20 @@ trainer.train()
 results = trainer.evaluate()
 print(results)
 
+# Save the model
 save_directory = "./fine_tuned_model"
 model.save_pretrained(save_directory)
 tokenizer.save_pretrained(save_directory)
-
 
 # Predict and generate the classification report
 predictions, labels, _ = trainer.predict(tokenized_testing)
 predicted_classes = predictions.argmax(axis=1)
 print(classification_report(labels, predicted_classes))
 
-# Plot Training and Evaluation Losses
-def plot_losses(train_losses, eval_losses):
-    plt.plot(train_losses, label="Training Loss")
-    plt.plot(eval_losses, label="Evaluation Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.legend()
-    plt.title("Training and Evaluation Loss")
-    plt.show()
-
-# Plot Losses
-plot_losses(train_losses, eval_losses)
+# Confusion Matrix
+cm = confusion_matrix(labels, predicted_classes)
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.title("Confusion Matrix")
+plt.show()
